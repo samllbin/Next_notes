@@ -1,3 +1,4 @@
+// app/page.js
 export default async function Page() {
   return (
     <div className="note--empty-state">
