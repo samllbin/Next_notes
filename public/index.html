@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="description" content="React with Server Components demo">
+    <meta name="description" content="React with Server Components demo" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="stylesheet" href="style.css" />
     <title>React Notes</title>
@@ -18,15 +18,15 @@
           try {
             return await nativeFetch(...args);
           } catch (e) {
-            if (args[1] && args[1].method !== 'GET') {
+            if (args[1] && args[1].method !== "GET") {
               // Don't retry mutations to avoid confusion
               throw e;
             }
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise((resolve) => setTimeout(resolve, 500));
           }
         }
         return nativeFetch(...args);
-      }
+      };
     </script>
   </body>
 </html>
