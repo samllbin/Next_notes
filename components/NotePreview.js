@@ -16,6 +16,7 @@ const allowedAttributes = Object.assign(
 );
 
 export default function NotePreview({ children }) {
+  console.log(children);
   return (
     <div className="note-preview">
       <div
