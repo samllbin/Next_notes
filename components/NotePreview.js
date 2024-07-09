@@ -1,33 +1,32 @@
-import { marked } from "marked";
-import sanitizeHtml from "sanitize-html";
+import {marked} from 'marked'
+import sanitizeHtml from 'sanitize-html'
 
 const allowedTags = sanitizeHtml.defaults.allowedTags.concat([
-  "img",
-  "h1",
-  "h2",
-  "h3",
-]);
+  'img',
+  'h1',
+  'h2',
+  'h3'
+])
 const allowedAttributes = Object.assign(
   {},
   sanitizeHtml.defaults.allowedAttributes,
   {
-    img: ["alt", "src"],
+    img: ['alt', 'src']
   }
-);
+)
 
 export default function NotePreview({ children }) {
-  console.log(children);
   return (
     <div className="note-preview">
       <div
         className="text-with-markdown"
         dangerouslySetInnerHTML={{
-          __html: sanitizeHtml(marked(children || ""), {
+          __html: sanitizeHtml(marked(children || ''), {
             allowedTags,
-            allowedAttributes,
-          }),
+            allowedAttributes
+          })
         }}
       />
     </div>
-  );
+  )
 }

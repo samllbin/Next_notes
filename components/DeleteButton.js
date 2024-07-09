@@ -1,9 +1,8 @@
-import { useFormStatus } from "react-dom";
+import { useFormStatus } from 'react-dom'
 
 export default function DeleteButton({ isDraft, formAction }) {
-  const { pending } = useFormStatus();
-  return (
-    !isDraft && (
+  const { pending } = useFormStatus()
+  return !isDraft && (
       <button
         className="note-editor-delete"
         disabled={pending}
@@ -20,5 +19,4 @@ export default function DeleteButton({ isDraft, formAction }) {
         Delete
       </button>
     )
-  );
 }

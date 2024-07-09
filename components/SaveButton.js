@@ -1,7 +1,7 @@
-import { useFormStatus } from "react-dom";
+import { useFormStatus } from 'react-dom'
 
 export default function EditButton({ formAction }) {
-  const { pending } = useFormStatus();
+  const { pending } = useFormStatus()
   return (
     <button
       className="note-editor-done"
@@ -17,7 +17,7 @@ export default function EditButton({ formAction }) {
         alt=""
         role="presentation"
       />
-      {pending ? "Saving" : "Done"}
+      {pending ? 'Saving' : 'Done'}
     </button>
   );
 }

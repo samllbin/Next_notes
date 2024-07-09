@@ -1,7 +1,10 @@
-import "./style.css";
-import Sidebar from "@/components/Sidebar";
+import './style.css'
+import Sidebar from '@/components/Sidebar'
 
-export default async function RootLayout({ children }) {
+export default async function RootLayout({
+  children
+}) {
+
   return (
     <html lang="en">
       <body>
@@ -13,5 +16,5 @@ export default async function RootLayout({ children }) {
         </div>
       </body>
     </html>
-  );
+  )
 }
