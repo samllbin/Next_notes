@@ -1,0 +1,1109 @@
+### 深入浅出React源码
+
+
+
+​		本文的React版本为18.2，主要基于FounctionComponent（函数式组件，下面简称FC）来走一遍mount的全流程以及hooks触发的更新执行时机和执行过程。希望能够坚持地读下去，可能会有点长，并且有主要的源码贴出，如果不想看代码直接看注释后后续的总结也能理解。相信读完后肯定会对React的一些设计原理和运行机制有了一定的了解，这样我们在开发的时候遇到问题也能从底层向上去找到问题并解决。
+
+#### 入口
+
+##### createRoot函数
+[createRoot函数代码位置](https://github.com/facebook/react/blob/main/packages/react-dom/client.js#L25)
+
+首先要去查看一个庞大库的源码肯定是需要一个入口的，那么这个入口就是"react-dom"下导出的ReactDOM，值得一提的是在React18+中，已经不推荐通过ReactDOM.render去挂载了，这样做的原因是React18的并发更新在这种情况下不会默认开启，而是得先去调用ReactDOM.createRoot先去创建一个root（React内部有时也会叫作container），然后再去调用root上的render方法进行挂载。可以看到createRoot有两个参数，第一个为container，也就是我们经常传进去的`<div id="root"></div>`，这个就是整个react之后挂载真实DOM的根，当然可以看到还可以传其他类型的参数，在这不考虑，第二个参数为可选的`CreateRootOptions`这些我们基本用不到，但可以大致看一下代表的是什么含义
+
+```js
+export type CreateRootOptions = {
+  unstable_strictMode?: boolean, //是否开启严格模式
+  unstable_concurrentUpdatesByDefault?: boolean, //是否开concurrent模式
+  unstable_transitionCallbacks?: TransitionTracingCallbacks, //传入一个对象用于追踪transitions的回调函数
+  identifierPrefix?: string, //用于给React元素添加一个前缀的ID
+  onRecoverableError?: (error: mixed) => void, //传入一个函数用于记录错误
+  ...
+};
+```
+一步一步跟进去后可以遇到另一个重要的函数调用[createContainer](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberReconciler.js#L248)，该函数用于创建fiberRootNode，关于fiber双缓存树的结构和fiber之间的关系可以用下面一张图来表示。
+
+![](C:\Users\86150\Desktop\画图\双缓存树机制.png)
+
+hostRootFiber其实就是我们传进去的`<div id="root"></div>`对应的fiber。fiberRootNode它负责在commit阶段的尾部进行workInProgress Fiber树和current Fiber树的切换，它的切换只是将current指针指向另一棵树就完成了切换，另外两棵树相同的fiber之间也会通过alternate指针进行互指，还有一些其他的指针这里就不做过多的赘述了。言归正传回到createContainer函数其内部是调用了另一个函数：[createFiberRoot](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberRoot.js#L143)，其就是创建了一个fiberRootNode以及hostRootFiber，为什么要连带创建这个hostRootFiber呢？这个和首屏渲染的优化有关。在beginWork阶段有介绍。
+
+然后可以简单的看一下fiberRootNode对象的一些属性，[具体位置](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberRoot.js#L48)
+
+```js
+  this.current = null; //当前current指针指向的fiber树
+  
+  this.callbackNode = null; //当前执行的更新回调
+  this.callbackPriority = NoLane; //当前执行的更新优先级
+  this.eventTimes = createLaneMap(NoLanes); //事件时间
+  this.expirationTimes = createLaneMap(NoTimestamp); //过期时间
+
+  this.pendingLanes = NoLanes; //待处理的更新的lane
+  this.suspendedLanes = NoLanes; //挂起的更新的lanes
+  this.pingedLanes = NoLanes; //被中断的更新的lanes
+  this.expiredLanes = NoLanes; //过期的更新的lanes
+```
+以及一些fiberNode的属性，[具体位置](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiber.js#L133)
+
+```js
+  this.key = key; //key
+  this.elementType = null; //<APP>不是原生的elemenr
+  this.type = null; 
+  this.stateNode = null; //指向真实DOM
+  
+  this.return = null; //父节点
+  this.child = null; //子节点
+  this.sibling = null; //指向右边的兄弟节点
+  this.index = 0; //在兄弟节点中的位置
+  
+  this.updateQueue = null; //更新队列，保存了当前fiber上的update
+  
+  this.flags = NoFlags; //当前fiber的flags标记，需要对DOM执行的操作与flags有关
+  this.subtreeFlags = NoFlags; //不包含自己的子fiber树的flags和
+  this.deletions = null; //需要删除的子fiber，最终体现在删除真实的DOM
+  
+  this.alternate = null; //指向另一棵树上想同的fiber节点
+```
+将root（fiberRootNode）进行返回，这个时候createFiberRoot就结束了，回到createContainer，后续的操作其中最主要的是注册React的合成事件，React17之前将事件监听注册在了document上，后续注册到了container上，具体原因大概有以下几点：
+- 与其他非React组件混合使用是可能会产生冲突
+- 不同React应用如果都将事件绑定在document上会相互产生干扰
+- SSR，服务端渲染时，服务器那不存在doucment对象
+- 优化：可能存在不是React的元素将事件也冒泡到了document，这时候都给到React去处理性能较差。
+
+具体内部是如何实现合成事件及注册和收集执行的不过多的展开，如果有机会可以后续讨论讨论。[后续代码位置](https://github.com/facebook/react/blob/main/packages/react-dom/src/client/ReactDOMRoot.js#L249)
+
+```js
+  markContainerAsRoot(root.current, container); //React的宿主环境容器和Fiber树之间建立联系，确保更新调度在正确的容器当中
+
+  const rootContainerElement: Document | Element | DocumentFragment = //确定React组件渲染时使用的容器，有element：1，text：3，commt：8，如果是8就让其父节点作为容器其他则是本身作为容器
+    container.nodeType === COMMENT_NODE
+      ? (container.parentNode: any)
+      : container;
+  listenToAllSupportedEvents(rootContainerElement); //注册监听事件
+
+  return new ReactDOMRoot(root); // 这一步将挂载render和unmount方法到原型链上
+```
+在ReactDOMRoot原型上挂载了render和unmount方法，马上就会调用。
+
+
+
+
+##### render函数
+
+[render函数位置](https://github.com/facebook/react/blob/main/packages/react-dom/src/client/ReactDOMRoot.js#L111)
+
+在正式进入render函数之前会有一个额外的操作，将我们传进去APP组件，由babel去将jsx变为js对象，调用React内部提供的createElement函数（React 16）或 jsx函数（React 17+）两者并没有区别，生成APP对应的ReactElement结构。
+
+```js
+root.render(<App />); //调用render函数之前会调用jsx函数或createElement函数进行生成ReactElement，生成的是APP的ReactElement
+```
+render函数简单来说就是调用了一下updateContainer函数，对container进行更新
+
+```js
+updateContainer(children, root, null, null); //children就是之前调用jsx编译的ReactElement产物，在这里是APP，root是fiberRootNode
+```
+[updateContainer](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberReconciler.js#L356)主要是创建update，然后合并到updateQueue中，并且开启新的调度
+
+```js
+   const eventTime = requestEventTime(); //当前事件的时间戳，用于后续计算过期时间以及优先级等
+   const lane = requestUpdateLane(current); //获取这次更新的优先级
+   
+   const update = createUpdate(eventTime, lane); //创建Update，eventTime
+   
+   callback = callback === undefined ? null : callback;
+   update.callback = callback;
+   
+   const root = enqueueUpdate(current, update, lane); //合并到updateQueue队列中
+     if (root !== null) {
+    scheduleUpdateOnFiber(root, current, lane, eventTime); //调度的入口
+    entangleTransitions(root, current, lane);
+  }
+   
+```
+scheduleUpdateOnFiber就是React的整个开始调度的入口
+
+
+
+#### schedule阶段
+scheduleUpdateOnFiber函数中大多数都是在对一些边缘的case进行处理以及内部的一些性能监控，主要的代码只有一行，调用[ensureRootIsScheduled](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberRootScheduler.js#L86)函数，可以简单来看一下ensureRootIsScheduled函数
+
+```js
+function ensureRootIsScheduled(root: FiberRoot, currentTime: number) { 
+    const existingCallbackNode = root.callbackNode; //确认执行哪个任务的回调
+    
+   const nextLanes = getNextLanes(
+    root,
+    root === workInProgressRoot ? workInProgressRootRenderLanes : NoLanes,
+  ); //确定下一个要处理的更新及其优先级,取优先级最高的
+  
+    if (nextLanes === NoLanes) {
+    // 特殊情况：这里没有更新需要做，取消这次更新
+    if (existingCallbackNode !== null) {
+      cancelCallback(existingCallbackNode);
+    }
+    root.callbackNode = null;
+    root.callbackPriority = NoLane;
+    return;
+  }
+  
+   //获得下个任务的回调优先级，schedule包中自己实现的优先级
+  const newCallbackPriority = getHighestPriorityLane(nextLanes);
+  const existingCallbackPriority = root.callbackPriority; //当前正在调度更新的优先级
+  
+    //正在调度的更新和这次产生的更新优先级是一样的，直接跳过即可，因为两者更新优先级相同，那么消费的update优先级都是一样的不需要再开启一次更新去消费这次更新产生的update。
+    //简单来说就是我俩优先级一样，能够干的事也一样，不需要你再产生一次更新
+    if ( 
+    existingCallbackPriority === newCallbackPriority && 其他条件) {
+        ...其他代码
+        return;
+  }
+  
+   if (existingCallbackNode != null) { //代表正在执行的更新优先级比这次产生的更新优先级低，需要取消现有任务
+    //取消现有回调。我们将在下面安排一个新的。
+    cancelCallback(existingCallbackNode);
+  }
+  //没有优先级比当前的小的，因为在当前更新的优先级也保存在lanes中，所以最差的情况也是本身自己的优先级，不存在比本身优先级低的被选出
+  
+  //调度新的回调函数，简单来说就是，如果是同步的lane，采取同步prioritie进行调度，其他的采取异步的priorities
+  let newCallbackNode;
+  //是否为同步的lane
+  if (newCallbackPriority === SyncLane) {
+      ...其他代码
+      scheduleSyncCallback(performSyncWorkOnRoot.bind(null, root)); // 采取微任务调度的回调
+      newCallbackNode = null; //同步调度不需要赋值，不可被后续更新打断
+      
+  } else {
+    let schedulerPriorityLevel;
+    //将lane -> priorities，因为lane是react自己的一套优先级策略，priorities是scheduler包中实现的另一套优先级
+    switch (lanesToEventPriority(nextLanes)) { 
+      case DiscreteEventPriority:
+        schedulerPriorityLevel = ImmediateSchedulerPriority;
+        break;
+      case ContinuousEventPriority:
+        schedulerPriorityLevel = UserBlockingSchedulerPriority;
+        break;
+      case DefaultEventPriority:
+        schedulerPriorityLevel = NormalSchedulerPriority;
+        break;
+      case IdleEventPriority:
+        schedulerPriorityLevel = IdleSchedulerPriority;
+        break;
+      default:
+        schedulerPriorityLevel = NormalSchedulerPriority;
+        break;
+    }
+    //concurrent模式采用宏任务调度异步更新
+    newCallbackNode = scheduleCallback(
+      schedulerPriorityLevel,
+      performConcurrentWorkOnRoot.bind(null, root),
+    ); 
+    
+  root.callbackPriority = newCallbackPriority;
+  root.callbackNode = newCallbackNode;
+}
+```
+**注：上面所说的同步还是异步其实和我们理解的不同，在React18+中所有的更新采取的都是异步调用，我们所谓的同步其实是采取微任务进行调度的，并且不开启时间切片，不可被打断，而异步是采取宏任务进行调度的，默认情况下能被打断和开启时间切片（特殊情况：过期时间快到会提高其的优先级）**
+
+
+
+
+##### scheduler包的扩展
+为了更好了解schedule阶段需要大致了解一下scheduler，在React16fiber推出后，React官方重写了scheduler调度器，在之前采用的是堆栈调度器，从字面意思上来看就能知道，更新是不能够被打断的，意味着某些紧急的事件会被阻塞，所以为了解决这个问题推出了fiber，并且重写调度器支持可中断更新和时间切片等特性。如果不想深入了解调度器的工作流程可以直接到总结部分。
+
+[scheduleCallback](https://github.com/facebook/react/blob/main/packages/scheduler/src/forks/Scheduler.js#L322)简单来说就是根据我们上面传进去的优先级以及回调函数创建一个task，然后根据是否延迟处理放到timerQueue中或taskQueue中，并且向浏览器请求空闲时间执行task。
+下面是主要的scheduleCallback代码：
+
+```js
+function unstable_scheduleCallback(priorityLevel, callback, options) {
+  var currentTime = getCurrentTime();
+
+  var startTime; //确认过期时间
+  if (typeof options === 'object' && options !== null) {
+    var delay = options.delay;
+    if (typeof delay === 'number' && delay > 0) {
+      startTime = currentTime + delay;
+    } else {
+      startTime = currentTime;
+    }
+  } else {
+    startTime = currentTime;
+  }
+
+  var timeout;// 不同的优先级，过期时间不同
+  switch (priorityLevel) {
+    case ImmediatePriority:
+      timeout = IMMEDIATE_PRIORITY_TIMEOUT;
+      break;
+    case UserBlockingPriority:
+      timeout = USER_BLOCKING_PRIORITY_TIMEOUT;
+      break;
+    case IdlePriority:
+      timeout = IDLE_PRIORITY_TIMEOUT;
+      break;
+    case LowPriority:
+      timeout = LOW_PRIORITY_TIMEOUT;
+      break;
+    case NormalPriority:
+    default:
+      timeout = NORMAL_PRIORITY_TIMEOUT;
+      break;
+  }
+
+  var expirationTime = startTime + timeout;
+
+  var newTask = { //创建task任务
+    id: taskIdCounter++,
+    callback,
+    priorityLevel,
+    startTime,
+    expirationTime,
+    sortIndex: -1,
+  };
+
+  //是否为延迟任务，timerQueue安排管理延迟任务
+  if (startTime > currentTime) { 
+    newTask.sortIndex = startTime;
+    push(timerQueue, newTask);
+    if (peek(taskQueue) === null && newTask === peek(timerQueue)) {
+      requestHostTimeout(handleTimeout, startTime - currentTime);
+    }
+  } else {
+    //不是延迟任务，放到taskQueue中，并且尽快执行回调
+    newTask.sortIndex = expirationTime;
+    push(taskQueue, newTask);
+
+
+    if (!isHostCallbackScheduled && !isPerformingWork) { //是否已经请求了一个浏览器的任务调度并且React当前是否正在工作
+      isHostCallbackScheduled = true;
+      requestHostCallback(flushWork);
+    }
+  }
+
+  return newTask;
+}
+```
+
+主要的点是如何去维护这两个队列的，这两个队列其实都是在维护一个小顶堆，他们先根据过期时间进行排序，如果相同则根据index（谁加入task的时间更早），当我们push到队列中时，除了直接push进去还会去执行上浮到操作，进行堆排序，当我们pop弹出任务时，会进行下沉的操作。用此方法保证每次取堆顶时都是优先级最高的。下面是代码：
+
+```js
+//push
+export function push(heap: Heap, node: Node): void {
+  const index = heap.length;
+  heap.push(node);
+  siftUp(heap, node, index);
+}
+
+//上浮
+function siftUp(heap, node, i) { 
+  let index = i;
+  while (index > 0) {
+    const parentIndex = (index - 1) >>> 1;
+    const parent = heap[parentIndex];
+    if (compare(parent, node) > 0) {
+      heap[parentIndex] = node;
+      heap[index] = parent;
+      index = parentIndex;
+    } else {
+      return;
+    }
+  }
+}
+
+//pop
+export function pop(heap: Heap): Node | null {
+  if (heap.length === 0) {
+    return null;
+  }
+  const first = heap[0];
+  const last = heap.pop();
+  if (last !== first) {
+    heap[0] = last;
+    siftDown(heap, last, 0);
+  }
+  return first;
+}
+
+//下沉
+function siftDown(heap, node, i) { 
+  let index = i;
+  const length = heap.length;
+  const halfLength = length >>> 1;
+  while (index < halfLength) {
+    const leftIndex = (index + 1) * 2 - 1;
+    const left = heap[leftIndex];
+    const rightIndex = leftIndex + 1;
+    const right = heap[rightIndex];
+
+    if (compare(left, node) < 0) {
+      if (rightIndex < length && compare(right, left) < 0) {
+        heap[index] = right;
+        heap[rightIndex] = node;
+        index = rightIndex;
+      } else {
+        heap[index] = left;
+        heap[leftIndex] = node;
+        index = leftIndex;
+      }
+    } else if (rightIndex < length && compare(right, node) < 0) {
+      heap[index] = right;
+      heap[rightIndex] = node;
+      index = rightIndex;
+    } else {
+      return;
+    }
+  }
+}
+
+//compare比较函数
+//先根据sortIndex来排序，sortIndex就为过期时间，然后再根据id来排序
+function compare(a, b) { 
+  const diff = a.sortIndex - b.sortIndex;
+  return diff !== 0 ? diff : a.id - b.id;
+}
+
+```
+当React收到浏览器可以空闲时间执行的消息后就会进入一个[workloop](https://github.com/facebook/react/blob/main/packages/scheduler/src/forks/Scheduler.js#L188)，它执行的功能也很简单就是在调用回调时先去timerQueue（延迟队列）中看是否有延迟时间已到的任务，将其加到taskQueue中去，选出taskQueue中的堆顶执行其的回调函数，当然还有很多细节，比如说中断的恢复判断是否为同一个更新，以及与浏览器的沟通是否需要将控制权交还给浏览器中断任务，还有判断是否有过期的任务并且如何处理等等，这就是比较完整的scheduler的工作流程了。
+
+
+
+##### scheduler包总结
+
+scheduler内部维护两个队列，一个taskQueue，根据exp（过期时间）排序，一个timerQueue根据delay排序，每次从taskQueue选第一个task执行，并判断是否timerQueue中有delay为0的任务，有则加到taskQueue中去。
+
+![](C:\Users\86150\Desktop\画图\无标题-2024-04-12-1500.png)
+
+schedule阶段到这就结束了，后面就是听的比较多的render阶段和commit阶段了。
+
+
+
+#### render阶段
+
+render阶段其实就是一个递归的过程，主要分为两个子阶段
+- beginWork阶段（递）
+- completeWork阶段（归）
+
+
+
+##### 准备阶段
+
+[performConcurrentWorkOnRoot](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L846)这是concurrent模式的beginWork的入口，还有一个sync（同步更新）的入口[performSyncWorkOnRoot](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L1339)这两者其实并无本质的区别，前者会根据lane和是否开启时间切片（表示该更新是否是可中断的或者控制权是否应当交回到浏览器的手中）去调用不同的render函数，而performSyncWorkOnRoot是直接去调用同步renderRoot函数。它们的返回值为exitStatus，表示renderRoot函数执行的结果，可能出错、可能未更新完、可能执行完成，根据不同状态执行不同的后续操作。
+
+``` javascript
+// performConcurrentWorkOnRoot
+const shouldTimeSlice =
+    !includesBlockingLane(root, lanes) && //是否有块级的优先级
+    !includesExpiredLane(root, lanes) && //是否过期
+    (disableSchedulerTimeoutInWorkLoop || !didTimeout); //是否需要交还控制权
+  let exitStatus = shouldTimeSlice
+    ? renderRootConcurrent(root, lanes)
+    : renderRootSync(root, lanes);
+
+// performSyncWorkOnRoot
+let exitStatus = renderRootSync(root, lanes);
+```
+
+两个renderRoot函数其实也是无区别的，[renderRootSync](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L1962)，[renderRootConcurrent](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L2103)其内部做的事情是调用prepareFreshStack函数初始化一个workInProgress Fiber树，当然也会进行一些判断，在某些情况下是不需要初始化的。下面图中，右边有颜色的是这次初始化的wip树，而左侧的current树和fiberRootNode是在之前createRoot函数中创建的。
+
+![](C:\Users\86150\Desktop\画图\初始化.png)
+
+在初始化wip树之后，一个去调用[workLoopSync](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L2096)函数，一个去调用[workLoopConcurrent](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L2355)，两个函数只有一个区别，循环的终止条件是不同的
+
+``` javascript
+function workLoopConcurrent() {
+  while (workInProgress !== null && !shouldYield()) { //是否应该中断
+    performUnitOfWork(workInProgress);
+  }
+}
+
+function workLoopSync() {
+  while (workInProgress !== null) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+
+function performUnitOfWork(unitOfWork: Fiber): void {
+  const current = unitOfWork.alternate;
+  setCurrentDebugFiberInDEV(unitOfWork);
+
+  let next;
+  ...其他代码
+  next = beginWork(current, unitOfWork, renderLanes);
+  if (next === null) {
+    //completeUnitOfWork内也是一个循环去判断是否有sibling，如果有就返回，无就继续父fiber的completeUnitOfWork
+    completeUnitOfWork(unitOfWork); // 到底了，准备返回
+  } else {
+    workInProgress = next; // 继续递进
+  }
+
+  ReactCurrentOwner.current = null;
+}
+```
+
+可以看到上面React使用了很多逻辑相同名字相似的函数去处理concurrent和sync，主要的目的就是去控制其的中断。接下来就是到了真正进入beginWork和completeWork的阶段，两者是穿插的进行的，可以举个例子方便更好的理解接下来的步骤。
+
+``` javascript
+//APP.jsx
+function App() {
+  const [count, setCount] = useState(0);
+
+  const debugHandleClick = () => {
+    setCount((c) => c + 1);
+  };
+
+  return (
+    <div className="App" key="App">
+      <p>{count}</p>
+      <p onClick={debugHandleClick}>App</p>
+    </div>
+  );
+}
+
+//index,jsx
+const container = document.getElementById("root");
+
+const root = ReactDOM.createRoot(container);
+root.render(<App />); 
+```
+
+下面是上述例子的整个render阶段的流程图，其中红色的箭头代表的是beginWork，蓝色的箭头代表completeWork
+
+``` javascript
+hostRootFiber 进行beginWork
+APP 进行beginWork
+div 进行beginWork
+P1 进行beginWork
+{count} 进行beginWork
+P1 进行completetWork
+P2 进行beginWork
+"APP" 进行beginWork
+P2 进行completetWork
+div 进行completetWork
+APP 进行completetWork
+hostRootFiber 进行completetWork
+```
+
+**注意的是，绿色的内容其实是在React内部被称作HostText，也就是字符串文本，其不会创建对应的fiber，但是也会存在beginWork阶段。**
+
+
+
+![](C:\Users\86150\Desktop\画图\render阶段流程图.png)
+
+##### beginWork阶段
+
+一句话总结beginWork阶段：**根据ReactElement和当前的current fiber的fiber进行比较生成子Fiber，以及对生成的fiber标记各种flags**，至于为什么要和current fiber进行对比？是因为存在很多可以复用的fiber，只需修改部分参数即可。
+
+[beginWork函数位置](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberBeginWork.js#L3829)，直接看它对不同tag的处理逻辑即可
+
+``` javascript
+function beginWork(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+): Fiber | null {
+...非主要代码
+  switch (workInProgress.tag) { //对还未明确其tag的处理
+    case IndeterminateComponent: {
+      return mountIndeterminateComponent(
+        current,
+        workInProgress,
+        workInProgress.type,
+        renderLanes,
+      );
+    }
+    case FunctionComponent: { //对函数式组件的处理
+      const Component = workInProgress.type;
+      const unresolvedProps = workInProgress.pendingProps;
+      const resolvedProps =
+        workInProgress.elementType === Component
+          ? unresolvedProps
+          : resolveDefaultProps(Component, unresolvedProps);
+      return updateFunctionComponent(
+        current,
+        workInProgress,
+        Component,
+        resolvedProps,
+        renderLanes,
+      );
+    }
+    case ClassComponent: {//对类组件的处理
+      const Component = workInProgress.type;
+      const unresolvedProps = workInProgress.pendingProps;
+      const resolvedProps =
+        workInProgress.elementType === Component
+          ? unresolvedProps
+          : resolveDefaultProps(Component, unresolvedProps);
+      return updateClassComponent(
+        current,
+        workInProgress,
+        Component,
+        resolvedProps,
+        renderLanes,
+      );
+    }
+    case HostRoot: //对hostRootFiber的处理
+      return updateHostRoot(current, workInProgress, renderLanes);
+    case HostComponent: //对原生的DOM元素的处理，如div，span等等
+      return updateHostComponent(current, workInProgress, renderLanes);
+    case HostText: //对文本的处理
+      return updateHostText(current, workInProgress);
+    case SuspenseComponent: //对suspense的处理
+      return updateSuspenseComponent(current, workInProgress, renderLanes);
+    case Fragment: //对Fragment的处理
+      return updateFragment(current, workInProgress, renderLanes);
+ 
+   case ...其他类型
+
+  throw new Error(
+    `Unknown unit of work tag (${workInProgress.tag}). This error is likely caused by a bug in ` +
+      'React. Please file an issue.',
+  );
+}
+```
+
+
+
+值得一提的是在如果某个fiber是初次mount的，也就是在当前的current fiber树上不存在与之对应的fiber，那么这个fiber在进入beginWork时将不会去追踪副作用，也就是不对标记flags，不再后续的commit阶段消费flags时对初次mount的真实DOM展开操作。从上面的图中我们可以清楚地看出，只有hostRootFiber在cuurent树上有其对应的fiber，所以在mount时期只有hostRootFiber会被打上一个Placement（移动）flag，在最后commit阶段我们只需对我们在后面completeWork中拼接好的离屏DOM树插到**div#root**中即可，如果初次mount也去追踪副作用，那么会大大增加操作真实DOM的次数，本身操作真实DOM就是一个很大的开销，所以这就是React内部对**首屏渲染以及组件mount的优化**。
+
+
+
+挑一个函数式组件看一下其内部是如何做的，[updateFunctionComponent](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberBeginWork.js#L1096)中最主要的代码是调用了renderWithHooks，renderWithHooks会返回子fiber以及对hooks的支持，也就是我们写函数式组件时renturn的jsx，所以函数式组件的本质其实就是函数的执行，其和其他函数主要的区别是返回的是一个jsx对象
+
+``` javascript
+    nextChildren = renderWithHooks(
+      current,
+      workInProgress,
+      Component,
+      nextProps,
+      context,
+      renderLanes,
+    );
+```
+
+
+
+[renderWithHooks](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js#L493)其主要代码：
+
+``` javascript
+export function renderWithHooks<Props, SecondArg>(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  Component: (p: Props, arg: SecondArg) => any,
+  props: Props,
+  secondArg: SecondArg,
+  nextRenderLanes: Lanes,
+): any {
+   //初始化操作
+  renderLanes = nextRenderLanes;
+  currentlyRenderingFiber = workInProgress;
+
+
+  workInProgress.memoizedState = null;
+  workInProgress.updateQueue = null;
+  workInProgress.lanes = NoLanes;
+
+    
+    ReactCurrentDispatcher.current =
+      current === null || current.memoizedState === null
+        ? HooksDispatcherOnMount
+        : HooksDispatcherOnUpdate; //指向不同的hooks集合
+
+  let children = Component(props, secondArg); //Component就是我们编写的函数式组件
+
+//重置操作
+  renderLanes = NoLanes;
+  currentlyRenderingFiber = (null: any);
+
+  currentHook = null;
+  workInProgressHook = null;
+
+
+  return children;
+}
+```
+
+
+
+这里面只需要关注一个点，就是它会根据不同的情况将ReactCurrentDispatcher.current指向不同的hooks集合让其执行，可能这样讲不太明白，可以画个图理解一下。可以考虑一下，我们在使用hooks的时候都是从react这个包下导出的，但是去查看就知道，它的实现并不在react包下，而是在react-reconciler包下ReactFiberHooks.js中实现的。其做法是内部有一个**内部数据共享层**（__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED）翻译过来也比较有意思（保密内部文件，禁止使用，否则将被解雇。），其内部有一个Dispatcher，根据不同场景将其指向不同的hooks集合，然后我们调用时就会调用不同集合内的hooks。这也是当我们在函数式组件外部使用hooks会报错的原因，因为在函数式组件外部使用hooks这个时候Dispatcher还未指向可执行的hooks集合，而是一个全部报错的地方，不管调用哪个函数都会报错。
+
+![](C:\Users\86150\Desktop\画图\共享层.png)
+
+执行完之后正常将children进行返回我们就可以拿到子fiber对应的ReactElement的结构了。
+
+
+
+###### mountState
+
+当我们执行FC时，遇到了`const [count, setCount] = useState(0);`这个时候指向的集合是HooksDispatcherOnMount中的mountState。那么上面也提到了函数式组件的本质是函数的执行，那我们都知道，函数本身是无法去保存一个状态的，这也是hooks推出的一个原因，赋予函数式组件拥有保存状态的功能。那么这个状态保存的地方是函数式组件对应的fiber上的，如下图所示。在Function Component上的memoizedState字段下保存着一个hooks链表，里面按照执行的顺序保存着hooks的信息，而每个hook都有一个字段memoizedState保存着属于这个hook的信息，比如useState保存的就是state值，useEffect保存的就是effects链表，将来会在commit的beforeMutation阶段被收集，统一执行。
+
+
+
+![](C:\Users\86150\Desktop\画图\hooks数据.png)
+
+下面是当我们在执行`Component(props, secondArg);`时碰到useState时执行的操作，大概就是创建一个hook添加到FCfiber的hooks链表中，保存初始化的值以及一个dispatcher函数，并将其返回，其他hooks也是类似的。
+
+``` javascript
+function mountState<S>(
+  initialState: (() => S) | S,
+): [S, Dispatch<BasicStateAction<S>>] {
+  const hook = mountWorkInProgressHook(); //初始化一个hook用于保存当前hook产生的信息
+  if (typeof initialState === 'function') { //传入的是一个函数
+    initialState = initialState();
+  }
+  hook.memoizedState = hook.baseState = initialState; // 初始化值
+  const queue: UpdateQueue<S, BasicStateAction<S>> = { //hook的updateQueue链表
+    pending: null,
+    lanes: NoLanes,
+    dispatch: null,
+    lastRenderedReducer: basicStateReducer,
+    lastRenderedState: (initialState: any),
+  };
+  hook.queue = queue;
+  const dispatch: Dispatch<
+    BasicStateAction<S>,
+  > = (queue.dispatch = (dispatchSetState.bind(
+    null,
+    currentlyRenderingFiber,
+    queue,
+  ): any)); //dispatch函数，后续触发更新的入口
+  return [hook.memoizedState, dispatch]; //返回memoizedState和dispatch函数
+}
+```
+
+
+
+##### beginWork总结
+
+beginWork干的事情无非就以下几点：
+
++ 根据不同的tag，进入beginWork函数中的不同流程
++ 虽进不同流程但都是根据ReactElement和current Fiber生成子fiber并挂载到wip Fiber树上
++ 在wip fiber树的fiber上打上不同操作的flags，供后期commit阶段使用，（placement：移动， ChildDeletion：有子节点删除，Update：需要更新，等等flags）
++ 在update时期可能会存在比如说能复用fiber的情况，这个时候会采用diff算法。
+
+
+
+##### completeWork阶段
+
+[completeWork](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCompleteWork.js#L941)阶段相比较beginWork阶段来说要简单一些，还是一句话总结：**将新增的节点插入到已存在的DOM树上，并且进行一个flags冒泡**
+
+``` javascript
+function completeWork(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+): Fiber | null {
+  const newProps = workInProgress.pendingProps;
+  switch (workInProgress.tag) {
+    case IndeterminateComponent:
+    case LazyComponent:
+    case SimpleMemoComponent:
+    case FunctionComponent:
+    case ForwardRef:
+    case Fragment:
+    case Mode:
+    case Profiler:
+    case ContextConsumer:
+    case MemoComponent:
+      bubbleProperties(workInProgress);
+      return null;
+    case ClassComponent: {
+      const Component = workInProgress.type;
+      if (isLegacyContextProvider(Component)) {
+        popLegacyContext(workInProgress);
+      
+      bubbleProperties(workInProgress);
+      return null;
+    }
+    case HostRoot: {
+      bubbleProperties(workInProgress);
+      return null;
+    }
+    case HostComponent: {
+      const type = workInProgress.type;
+      if (current !== null && workInProgress.stateNode != null) {
+        updateHostComponent(current, workInProgress, type, newProps); //更新DOM，将DOM插入到已存在的DOM树中
+        if (current.ref !== workInProgress.ref) {
+          markRef(workInProgress); //ref是否改变，是则标记Ref
+        }
+      }
+
+      bubbleProperties(workInProgress);
+      return null;
+    }
+    case HostText: {
+      const newText = newProps;
+      const oldText = current.memoizedProps;
+      updateHostText(current, workInProgress, oldText, newText);
+
+      bubbleProperties(workInProgress);
+      return null;
+    }
+
+  ...其他类型
+        
+  throw new Error(
+    `Unknown unit of work tag (${workInProgress.tag}). This error is likely caused by a bug in ` +
+      'React. Please file an issue.',
+  );
+}
+```
+
+上面是简化后的completeWork代码，除HostComponent（原生标签，div，span等）和HostText（文本），其他tags基本都是进行flags冒泡即可，具体是咋冒泡的和为什么要冒泡，先搞懂两个字段，一个是flags、一个是subtreeFlags，在上面简单介绍fiber中常用的属性时也有提到，即**flags**是指自身fiber被打上的flags，**subtreeFlags**是指以自身为根节点的所有后代fiber的flags的合集（不包含自身的flags）。这样做的目的是便于后面commit阶段消费flags，当我们subtreeFlags一直有我们需要消费的flags时，逐渐往下找，突然没有了，那么就在上一层中的兄弟节点中寻找即可。
+
+[updateHostComponent](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCompleteWork.js#L421)代码就不列出来了，其干的事情就是：
+
++ 检查children是否改变，是否需要更新DOM
++ 如果`oldProps !== newProps`，打上标记准备更新
++ 选择clone或者创建一个DOM实例
++ 将clone或创建出来的DOM实例插到已存在的DOM树的该层的末尾
+
+
+
+#### render阶段总结
+
+​		在render阶段中我们就只在completeWork阶段进行了往真实DOM树添加节点，其他的时候都是在比较两棵fiber树和ReactElement，然后在workInProgress树为fiber根据其对应的DOM节点需要执行的操作打上不同的flags，为后续commit阶段开始真正操作真实DOM树做准备。所以**render阶段是能够被打断的**，而**commit阶段是不能够被打断的**。
+
+​		接下来是我的个人见解，如有不对的地方还请大佬指点：在render阶段，甚至说fiber的作用，都是在为commit阶段操作真实的DOM打草稿，通过去比较currentFiber树（当前屏幕上显示的）和ReactElement（目标状态）去生成了workInProgress Fiber树，并且在wip Fiber树上打上标记，这就是在计算从currentFiber树对应的DOM结构变换到wipFiber树对应的DOM结构所需操作真实DOM最少的情况。这可以用一句很形象的话来描述，那就是：**render阶段结合fiber（两棵fiber树）就是在为操作真实DOM打草稿。**
+
+
+
+#### commit阶段
+
+上面也有提到，commit阶段一句话总结就是：**开始消费flags去操作真实DOM使current Fiber树对应的DOM结构变成WIP Fiber树对应的DOM结构，且该过程是不可打断的。**
+
+[commit位置](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L2714)，部分源码：
+
+``` javascript
+function commitRootImpl(
+  root: FiberRoot,
+  recoverableErrors: null | Array<CapturedValue<mixed>>,
+  transitions: Array<Transition> | null,
+  renderPriorityLevel: EventPriority,
+) {
+  do {
+    flushPassiveEffects();
+  } while (rootWithPendingPassiveEffects !== null); //循环清除非本次更新产生的effects，可能effects中还会产生effects
+
+  // 重置操作
+  const finishedWork = root.finishedWork;
+  const lanes = root.finishedLanes;
+  root.finishedWork = null;
+  root.finishedLanes = NoLanes;
+  root.callbackNode = null;
+  root.callbackPriority = NoLane;
+
+  //标记已更新
+  markRootFinished(root, remainingLanes);
+
+
+  //判断当前这次更新是否产生了effects需要处理，异步执行，可以控制其在空闲期执行，不阻塞后续优先级高的流程。
+  if (
+    (finishedWork.subtreeFlags & PassiveMask) !== NoFlags ||
+    (finishedWork.flags & PassiveMask) !== NoFlags
+  ) {
+    if (!rootDoesHavePassiveEffects) {
+      scheduleCallback(NormalSchedulerPriority, () => {
+        flushPassiveEffects();//注册清理副作用的 task
+        return null;
+      });
+    }
+  }
+
+  //子树上是否有需要处理的flags
+  const subtreeHasEffects =
+    (finishedWork.subtreeFlags &
+      (BeforeMutationMask | MutationMask | LayoutMask | PassiveMask)) !==
+    NoFlags;
+      
+  //root本身是否有需要处理的flags
+  const rootHasEffect =
+    (finishedWork.flags &
+      (BeforeMutationMask | MutationMask | LayoutMask | PassiveMask)) !==
+    NoFlags;
+
+  if (subtreeHasEffects || rootHasEffect) {
+
+     //beforeMutation阶段
+    commitBeforeMutationEffects(root,finishedWork);
+     
+     //mutation阶段
+    commitMutationEffects(root, finishedWork, lanes)
+    
+    //完成双缓冲树的切换
+    root.current = finishedWork;
+	
+    //layout阶段
+    commitLayoutEffects(finishedWork, root, lanes);
+   
+  }
+```
+
+
+
+##### beforeMutation阶段之前
+
+​		在before阶段之前会进行调用[flushPassiveEffects](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberWorkLoop.js#L3175)去清除非本次和本次产生的更新，对与非本次产生的更新产生的effects，采取的是同步的调用，如果不采取同步的调用，那会存在某些effects一直不能被执行的情况。而对于本次更新产生的effects则是采取的异步调度，交给scheduler，在空闲的时候调度。**值得注意的是虽然在beforeMutation阶段调用了执行effects的函数但是我们收集effects的时候是在Mutation阶段的。**
+
+
+
+##### beforeMutation阶段
+
+[commitBeforeMutationEffects](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCommitWork.js#L367)消费的flags有以下几种：
+
+``` javascript
+export const BeforeMutationMask =
+  Update | //更新update
+  Snapshot | //组件需要快照
+  (enableCreateEventHandleAPI 
+    ? ChildDeletion | Visibility //有删除的节点和组件的可见性
+    : 0);
+```
+
+针对这些flags进行消费，对于一种flag但是也会存在类似beginWork的逻辑，根据不同tags进入不同的流程。
+
+
+
+##### Mutation阶段
+
+[commitMutationEffectsOnFiber](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCommitWork.js#L2539)消费的flags有以下几种：
+
+``` javascript
+export const MutationMask =
+  Placement | //移动
+  Update | //更新
+  ChildDeletion | //有删除节点
+  ContentReset | //需要重置内容
+  Ref | //有ref需要解绑
+  Hydrating | //需要水和
+  Visibility; //组件可见性
+```
+
+又见到了几个熟悉的面孔，为什么Update在之前已被消费了现在又来了，在之前消费的Update只是消费了部分tags的，而Mutation阶段大部分的update都是去执行收集effects回调，当然在其他flags中也会存在收集effects，比如childDeletion我们就应该去判断是否有unmount的回调，收集的回调往root的pendingPassiveEffects不同类型的type中放，下面是简化后自己编写的代码。
+
+``` javascript
+function commitPassiveEffect(fiber, root, type) {
+	if (
+		fiber.tag !== FunctionComponent ||
+		(type === 'update' && (fiber.flags & PassiveEffect) === NoFlags)
+	) {
+		return;
+	}
+	const updateQueue = fiber.updateQueue
+	if (updateQueue !== null) {
+		root.pendingPassiveEffects[type].push(updateQueue.lastEffect); //type一般有update和unmpunt
+	}
+}
+```
+
+​		其他的flags也有对应的操作，比如Placement的流程为：找到hostParent（真实的父DOM元素）以及稳定的HostSibling（不带placement的兄弟DOM元素），先判断是否能插到HostSibling对应真实DOM的**前面**，如果不能则直接插到该层的最末尾即可。对于Ref就是将ref值变为null即可，在layout阶段我们会绑定新的ref，因为在mutation和layout阶段之间会进行两棵树的切换，到layout阶段就正式确定了DOM树的结构。
+
+
+
+##### 双树切换
+
+``` javascript
+//将Root指向finishedWork
+root.current = finishedWork;
+```
+
+//TODO：
+
+这里叫做双树切换可能会有一点误解，查看源码未发现在commit阶段对root.current的处理，但是在后续创建hostRootFiber的时候以及后续生成子fiber时又对其进行了复用，垃圾回收因为current树的引用并没有回收该树，所以
+
+表示真实DOM的结构已确定下来，后续不改变。
+
+
+
+##### layout阶段
+
+[commitLayoutEffectOnFiber](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberCommitWork.js#L1049)消费的flags有以下几种：
+
+``` javascript
+export const LayoutMask = 
+      Update | 
+      Callback | 
+      Ref | 
+      Visibility;
+```
+
+又又又有Update，在这消费Update的操作是触发生命周期钩子，比如说componentDidMount和componentDidUpdate。还有callback，比如我们在setState中传入的第二个回调就会在这执行，还有useLayoutEffect的回调也会在这执行。
+
+
+
+#### commit阶段总结
+
+一句话就是：**消费flags，操作真实DOM**。到这mount时期就算结束了，后续就开启新一轮的调度以及一些重置的操作了。
+
+
+
+### dispatche触发更新
+
+​		我们都知道，触发React更新的“源泉”在我们开发者自己手上，我们可以通过setState或者useState返回的dispatche去触发更新，在这就跟随dispatche，看一下是如何更新的。
+
+
+
+#### dispatche函数
+
+[dispatche](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js#L3254)函数主要代码如下：
+
+``` javascript
+function dispatchSetState<S, A>(
+  fiber: Fiber,
+  queue: UpdateQueue<S, A>,
+  action: A,
+) {
+    
+	//获取这次更新的优先级
+  const lane = requestUpdateLane(fiber); 
+
+    //创建一个update
+  const update: Update<S, A> = { 
+    lane,
+    action,
+    hasEagerState: false,
+    eagerState: null,
+    next: (null: any),
+  };
+
+
+    enqueueConcurrentHookUpdateAndEagerlyBailout(fiber, queue, update);
+    return; // 通过浅比较 提前退出更新调度
+     
+    ReactCurrentDispatcher.current = prevDispatcher;
+
+	//将创建出来的update合并到发生位置fiber的updateQueue中
+    const root = enqueueConcurrentHookUpdate(fiber, queue, update, lane);
+    if (root !== null) {
+        //获取更新时间，用于后续过期时间的判断
+      const eventTime = requestEventTime();
+        //开启调度
+      scheduleUpdateOnFiber(root, fiber, lane, eventTime);
+    }
+  }
+
+}
+```
+
+​		其实我们可以看到，dispatchSetState函数里主要做的事情就是将我们产生的更新，比如`setCount(() => count + 1)`抽象成一个update对象，然后将其加到fiber的updateQueue中，准备被消费。
+
+​		scheduleUpdateOnFiber就是我们之前说的schedule阶段的入口，干的事情也和上面mount时期干的一样，简单来说就是选出一个优先级最高的任务开始执行。
+
+
+
+#### updateState
+
+​		其他的操作和在mount时期干的大差不差，不过这次我们的current Fiber树上是有fiber节点的，所以要考虑节点是否能复用的问题。当我们碰到FC的beginWork时，因为我们在current Fiber上有对应的fiber了，所以它会指向HooksDispatcherOnUpdate中的updateState，当我们执行FC时碰到useState执行的其实就是updateState了。
+
+``` javascript
+ReactCurrentDispatcher.current =
+    current === null || current.memoizedState === null
+    ? HooksDispatcherOnMount
+	: HooksDispatcherOnUpdate; //指向不同的hooks集合
+```
+
+[updateState位置](https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberHooks.js#L1820)感兴趣的同学可以去看，下面直接口述消费的流程
+
+``` javascript
+const hook = updateWorkInProgressHook();
+```
+
+值得注意的是这一个点，这个是在复用currentFiber树上对应hook的数据，这也是React不支持hooks写在循环或者判断语句里的原因，因为这样可能useState拿到的数据是useEffect的。
+
+#### 消费update
+
+先弄懂几个概念：
+
++ renderLane：当次更新的优先级
++ updateLane：这个update对应的优先级，会存在update未消费完遗留的情况
++ baseQueue：之前更新由于优先级或其他原因未被消费的第一个update及其后续updates形成的环状链表
++ pendingQueue：这次更新产生的updates形成的链表
++ baseState：计算State的基础值，一般是遇到第一个优先级不够的update之前的updates计算的值
++ memoizedState：返回给外面使用的值，所有优先级够的update计算的值
+
+
+
+第一步：将baseQueue和pendingQueue合并，两个都是循环链表，都指向最后一个插入的update，其next指向的是第一个update。
+
+![](C:\Users\86150\Desktop\画图\合并updateQueue.png)
+
+
+
+
+
+第二步：消费update，这里假设每个update的操作都是+1，而baseState初始值为0，并且假设这次的renderLane = 1（越小优先级越高）
+
+![](C:\Users\86150\Desktop\画图\消费update.png)
+
+
+
+计算update1：updateLane <= renderLane，优先级够，newBaseState + 1， memoizedState  + 1
+
+计算update2：updateLane <= renderLane，优先级够，newBaseState + 1， memoizedState  + 1
+
+计算update3：updateLane > renderLane，优先级不够，newBaseState已被确定下来， memoizedState不变， 将update3加到newBaseQueue中
+
+计算update4：updateLane <= renderLane，优先级够，newBaseState已被确定， memoizedState  + 1，将update4加到newBaseQueue中
+
+计算update5：updateLane > renderLane，优先级不够，newBaseState已被确定， memoizedState不变，将update5加到newBaseQueue中
+
+计算update6：updateLane <= renderLane，优先级够，newBaseState已被确定， memoizedState  + 1，将update6加到newBaseQueue中
+
+
+
+第三步返回memoizedState，newBaseState，newBaseQueue：memoizedState将供这次更新的count使用，也就是当我们{count}时，它的值是4，也就是说当baseState===memoizedState时，表示无再需消费的update。
+
+
+
+#### 举个栗子
+
+问题：以下组件在React18concurrent模式下点击后会渲染几次？每次的值分别是什么？
+
+``` javascript
+function App() {
+	const [state, setState] = useState(1);
+	const [isPending, startTransition] = useTransition();
+	return (
+		<div
+			className="App"
+			onClick={() => {
+				setState('1');
+				startTransition(() => {
+					setState((s) => s + '2');
+				});
+				setState((s) => s + '3');
+				startTransition(() => {
+					setState((s) => s + '4');
+				});
+			}}
+		>
+			{state}
+		</div>
+	);
+}
+```
+
+**useTransition简单理解就是将获取优先级的函数上下文进行了一个修改，在里面触发的更新优先级是比较低的。**
+
+
+
+点击后：第一次的结果为13
+
+![](C:\Users\86150\Desktop\画图\第一次消费.png)
+
+第二次结果：1234
+
+![](C:\Users\86150\Desktop\画图\第二次消费.png)
+
+
+
+​		总的来说，会渲染两次，第一次结果为13，第二次结果为1234。至于为什么会这样做，还是为了提升用户的体验，先执行用户比较敏感的updates，但是最后的结果和按正常updates顺序执行的结果是一致的。
+
+​		到这触发更新的特殊点就结束了，其他的流程和mount时期大差不差。
+
+
+
+### 总结
+
+​		React源码还是比较难读的，我在文章中提取出来的代码全是核心的代码，还有一些其他边缘case或者一些性能监控又或者其他库的接入代码都没有列出来。相信大佬们都能读懂，如果又发现哪里理解的不对的地方，恳请斧正。
+
+​		写到这里人已经麻木了，这篇文章写了两天，近万字。文笔可能不是很好，但是已经尽我最大能力去表述清楚了，如果大佬们觉得写的还行，请点个赞鼓励一下吧。
